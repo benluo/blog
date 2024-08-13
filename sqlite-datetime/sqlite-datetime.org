@@ -1,0 +1,274 @@
+#+TITLE: DateTime issues in Sqlite Drivers | Sqlite 驱动在 DateTime 格式的问题
+#+author: Ben Luo
+
+最近在试着用不用的编程语言来实现同一个功能。数据库用的 Sqlite3，发现各语言 Sqlite 驱动对 DateTime with TimeZone 的支持是不一致的。导致一个语言写入的时间，在另一个语言中不能准确读出。
+
+* 设置如下
+| Golang 1.17                          | Scala 3.1.1                               | Python 3.10     |
+|--------------------------------------+-------------------------------------------+-----------------|
+| github.com/mattn/go-sqlite3 v1.14.11 | "org.xerial" % "sqlite-jdbc" % "3.36.0.3" | sqlalchemy 1.14 |
+* Golang 1.17
+#+begin_src go
+package main
+
+import (
+
+	"context"
+	"database/sql"
+	"log"
+
+	"benluo/teamware/database"
+	"benluo/teamware/ent"
+	"benluo/teamware/ent/user"
+	"benluo/teamware/router"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+
+	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/bcrypt"
+)
+
+func main() {
+  initDB()
+  r := initGin()
+  port := ":8060"
+  _ = r.Run(port)
+}
+
+func initDB() {
+  const dbConnectionString = "file:db.sqlite3?_fk=1"
+  const dbEngine = "sqlite3"
+  var err error
+  database.DBClient, err = ent.Open(dbEngine, dbConnectionString)
+  if err != nil {
+    log.Fatalf("failed opening connection to sqlite: %v", err)
+  }
+  ctx := context.Background()
+  if err := database.DBClient.Schema.Create(ctx); err != nil {
+    log.Fatalf("failed creating schema resources: %v", err)
+  }
+  initUser(ctx)
+}
+
+func initUser(ctx context.Context) {
+  email := "benluo@benluo.biz"
+  password := []byte("xxxx")
+  hashedP, _ := bcrypt.GenerateFromPassword(password, bcrypt.DefaultCost)
+    database.DBClient.User.Create().SetEmail(email).
+      SetPassword(string(hashedP)).
+      Save(ctx)
+  }
+}
+
+func initGin() *gin.Engine {
+  r := gin.Default()
+  config := cors.DefaultConfig()
+  config.AllowAllOrigins = true
+  config.AllowMethods = []string{"PUT", "PATCH", "GET", "DELETE", "POST"}
+  r.Use(cors.New(config))
+  router.SetupRouter(r)
+  return r
+}
+
+// ----------------
+package schema
+
+import (
+  "time"
+
+  "entgo.io/ent"
+  "entgo.io/ent/schema/edge"
+  "entgo.io/ent/schema/field"
+)
+
+// User holds the schema definition for the User entity.
+type User struct {
+  ent.Schema
+}
+
+// Fields of the User.
+func (User) Fields() []ent.Field {
+  return []ent.Field{
+    field.String("email").Default(""),
+    field.String("password"),
+    field.Time("created_at").Default(time.Now),
+  }
+}
+#+end_src
+** 结果
+#+begin_src txt
+2022-02-12 06:44:26.4638302+08:00
+#+end_src
+** 原因
+1. golang time 缺省支持的是 RFC3339, 日期和时间可以是 T（ISO-8601 标准）也可以是空格。
+2. sqlite 驱动写入 DateTime 时，有几种选项，但驱动的源代码直接使用第一种方式，就是空格的方式。
+   [[https://github.com/benluo/go-sqlite3/blob/master/sqlite3.go]]
+   #+begin_src go
+   var SQLiteTimestampFormats = []string{
+	// By default, store timestamps with whatever timezone they come with.
+	// When parsed, they will be returned with the same timezone.
+	"2006-01-02 15:04:05.999999999-07:00",
+	"2006-01-02T15:04:05.999999999-07:00",
+	"2006-01-02 15:04:05.999999999",
+	"2006-01-02T15:04:05.999999999",
+	"2006-01-02 15:04:05",
+	"2006-01-02T15:04:05",
+	"2006-01-02 15:04",
+	"2006-01-02T15:04",
+	"2006-01-02",
+}
+
+// line 1696
+case time.Time:
+				b := []byte(v.Format(SQLiteTimestampFormats[0]))
+				rv = C._sqlite3_bind_text(s.s, n, (*C.char)(unsafe.Pointer(&b[0])), C.int(len(b)))
+			}
+   #+end_src
+* Scala 3.1.1
+** 代码
+#+begin_src scala
+package model
+
+import java.time.OffsetDateTime
+
+case class User(
+    id: Int,
+    email: String,
+    password: String,
+    created_at: OffsetDateTime = OffsetDateTime.now()
+)
+
+
+// -----------------------
+package repository
+
+import doobie.*
+import doobie.implicits.*
+import cats.*
+import cats.effect.*
+import cats.implicits.*
+
+object CommonRep:
+  val xa = Transactor.fromDriverManager[IO](
+    "org.sqlite.JDBC", // driver classname
+    "jdbc:sqlite:db"
+  )
+
+
+// ------------------------------
+package repository
+
+import cats.effect.IO
+import doobie.*
+import doobie.implicits.*
+import doobie.implicits.javatimedrivernative.*
+import model.User
+import CommonRep.xa
+
+object UserRep:
+  def all =
+    sql"select * from users"
+      .query[User]
+      .to[List]
+      .transact(xa)
+
+
+// -------------------
+package routes
+
+import cats.effect.*
+import cats.effect.unsafe.implicits.global
+import io.circe.generic.auto.*
+import io.circe.syntax.*
+
+import org.http4s.*
+import org.http4s.dsl.io.*
+import org.http4s.circe.*
+import org.http4s.implicits.*
+
+import scala.concurrent.ExecutionContext.Implicits.global
+
+import repository.UserRep.*
+import doobie.*
+import doobie.implicits.*
+import doobie.implicits.javatimedrivernative.*
+
+val userRoutes = HttpRoutes.of[IO] { case GET -> Root / "users" =>
+  for
+    data <- all.map(_.asJson)
+    resp <- Ok(data)
+  yield (resp)
+}
+#+end_src
+** 结果
+#+begin_src txt
+ERROR o.h.s.service-errors - Error servicing request: GET /api/users from ::1
+java.lang.ClassNotFoundException: org.sqlite.JDBC
+#+end_src
+不能解析 golang 写入的 DateTime 信息。
+** 原因
+1. sqlite 的 jdbc 不支持 Datetime。
+2. golang 写入 sqlite 数据库的格式不是 ISO-6801 格式。
+* Python 3.10
+** 代码
+#+begin_src python
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import Column, Integer, String, Sequence, ForeignKey, DECIMAL, DateTime, create_engine
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+import datetime
+
+import hashlib
+
+Base = declarative_base()
+
+class User(Base):
+    """User who can use the db"""
+
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    email = Column(String(100))
+    password = Column(String(100))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    def __init__(self, email, password, created_at=func.now()):
+    #, created_at=datetime.datetime.now()):
+        self.email = email
+        self.password = hashlib.sha256(password).hexdigest()
+        self.created_at = created_at
+
+    def __repr__(self):
+        """
+        Arguments:
+        - `self`:
+        """
+        return self.email
+
+
+engine = create_engine('sqlite:///db', echo=True)
+
+from sqlalchemy.orm import sessionmaker
+Session = sessionmaker(bind=engine)
+
+session = Session()
+
+user = User(email="benluo@benluo.biz", password='xxxx'.encode("utf8"))
+session.add(user)
+session.commit()
+
+users = session.query(User).all()
+print(users[0].created_at)
+#+end_src
+** 结果
+#+begin_src txt
+2022-02-12 06:44:26.463830
+#+end_src
+没有 timezone 信息
+** 原因
+1. python3 自带的 sqlite 支持的不好。
+2. go 写入的时间信息是小数点后七位，但 Python timedate.fromisoformat(string) 只支持小数点后六位。
+* 用 postgresql 的对比
+三种全都可以正常显示日期，时间和时区
+* 结论
+Sqlite 本身的特点和驱动的 Bug，sqlite 并不适合作为多种语言的通用数据库。
